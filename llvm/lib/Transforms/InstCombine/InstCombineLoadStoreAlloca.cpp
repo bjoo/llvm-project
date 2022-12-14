@@ -60,8 +60,12 @@ isOnlyCopiedFromConstantMemory(AAResults *AA, AllocaInst *V,
         continue;
       }
 
-      if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I)) {
         // If uses of the bitcast are ok, we are ok.
+      if (isa<PHINode>(I)) {
+        ValuesToInspect.emplace_back(I, true);
+        continue;
+      }
+      if (isa<BitCastInst, AddrSpaceCastInst>(I)) {
         ValuesToInspect.emplace_back(I, IsOffset);
         continue;
       }
@@ -107,7 +111,8 @@ isOnlyCopiedFromConstantMemory(AAResults *AA, AllocaInst *V,
       }
 
       // If this is isn't our memcpy/memmove, reject it as something we can't
-      // handle.
+      // handle. If a PHI was already defined, then this MemTransferInst is a
+      // descendant of the PHI. Reject this case as well.
       MemTransferInst *MI = dyn_cast<MemTransferInst>(I);
       if (!MI)
         return false;
@@ -242,7 +247,7 @@ class PointerReplacer {
 public:
   PointerReplacer(InstCombinerImpl &IC) : IC(IC) {}
 
-  bool collectUsers(Instruction &I);
+  bool collectUsers(Instruction &I, MemTransferInst *Copy);
   void replacePointer(Instruction &I, Value *V);
 
 private:
@@ -255,16 +260,31 @@ private:
 };
 } // end anonymous namespace
 
-bool PointerReplacer::collectUsers(Instruction &I) {
+bool PointerReplacer::collectUsers(Instruction &I, MemTransferInst *Copy) {
   for (auto *U : I.users()) {
     auto *Inst = cast<Instruction>(&*U);
     if (auto *Load = dyn_cast<LoadInst>(Inst)) {
       if (Load->isVolatile())
         return false;
       Worklist.insert(Load);
-    } else if (isa<GetElementPtrInst>(Inst) || isa<BitCastInst>(Inst)) {
+    } else if (auto *PHI = dyn_cast<PHINode>(Inst)) {
+      // Check if any of the incoming values of PHI is the destination of Copy
+      unsigned CopySrcAddrSpace = Copy->getSourceAddressSpace();
+      unsigned PHIAddrSpace = PHI->getType()->getPointerAddressSpace();
+      for (unsigned Idx = 0; Idx < PHI->getNumIncomingValues(); ++Idx) {
+        auto *V = PHI->getIncomingValue(Idx);
+        if (CopySrcAddrSpace != PHIAddrSpace && V == Copy->getDest())
+          return false;
+        if (auto *Inst = dyn_cast<Instruction>(V))
+          Worklist.insert(Inst);
+      }
+
+      Worklist.insert(PHI);
+      if (!collectUsers(*PHI, Copy))
+        return false;
+    } else if (isa<GetElementPtrInst, BitCastInst>(Inst)) {
       Worklist.insert(Inst);
-      if (!collectUsers(*Inst))
+      if (!collectUsers(*Inst, Copy))
         return false;
     } else if (auto *MI = dyn_cast<MemTransferInst>(Inst)) {
       if (MI->isVolatile())
@@ -299,7 +319,15 @@ void PointerReplacer::replace(Instruction *I) {
     IC.InsertNewInstWith(NewI, *LT);
     IC.replaceInstUsesWith(*LT, NewI);
     WorkMap[LT] = NewI;
-  } else if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+  } else if (auto *PHI = dyn_cast<PHINode>(I)) {
+    Type *NewTy = getReplacement(PHI->getIncomingValue(0))->getType();
+    auto *NewPHI = PHINode::Create(NewTy, PHI->getNumIncomingValues(),
+                                   PHI->getName(), PHI);
+    for (unsigned int I = 0; I < PHI->getNumIncomingValues(); ++I)
+      NewPHI->addIncoming(getReplacement(PHI->getIncomingValue(I)),
+                          PHI->getIncomingBlock(I));
+    WorkMap[PHI] = NewPHI;
+ } else if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
     auto *V = getReplacement(GEP->getPointerOperand());
     assert(V && "Operand not replaced");
     SmallVector<Value *, 8> Indices;
@@ -433,7 +461,7 @@ Instruction *InstCombinerImpl::visitAllocaInst(AllocaInst &AI) {
       }
 
       PointerReplacer PtrReplacer(*this);
-      if (PtrReplacer.collectUsers(AI)) {
+      if (PtrReplacer.collectUsers(AI, Copy)) {
         for (Instruction *Delete : ToDelete)
           eraseInstFromFunction(*Delete);
 
